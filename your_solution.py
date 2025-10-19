@@ -11,9 +11,10 @@ from transformers import (
 import torch
 import wandb
 import time
+import math
 
 
-# Don't change this parameter
+# Don't change this parameters
 MAX_TRAINING_TIME_SECONDS = 60 * 30
 MAX_LENGTH = 512
 INPUT_IDS = 'input_ids'
@@ -76,7 +77,9 @@ def prepare_tokenizer():
     - Set pad_token to eos_token
     - Return the tokenizer
     """
-    pass
+    tokenizer = AutoTokenizer.from_pretrained(TOKENIZER_NAME)
+    tokenizer.pad_token = tokenizer.eos_token
+    return tokenizer
 
 
 def tokenize_function(examples, tokenizer):
@@ -86,7 +89,15 @@ def tokenize_function(examples, tokenizer):
     - Create labels from input_ids
     - Return dictionary with 'labels', 'input_ids', and 'attention_mask'
     """
-    pass
+    tokenized = tokenizer(
+        examples['text'],
+        truncation=True,
+        padding='max_length',
+        max_length=MAX_LENGTH,
+        return_tensors=None
+    )
+    tokenized[LABELS] = tokenized[INPUT_IDS].copy()
+    return tokenized
 
 
 def save_as_parquets(ds, output_dir=OUTPUT_DIR, num_shards=NUM_SHARDS):
@@ -96,7 +107,17 @@ def save_as_parquets(ds, output_dir=OUTPUT_DIR, num_shards=NUM_SHARDS):
     - Split dataset into num_shards shards
     - Save each shard as a parquet file with format: {output_dir}/{index:05d}.parquet
     """
-    pass
+    os.makedirs(output_dir, exist_ok=True)
+    
+    shard_size = len(ds) // num_shards
+    for i in range(num_shards):
+        start_idx = i * shard_size
+        end_idx = start_idx + shard_size if i < num_shards - 1 else len(ds)
+        
+        shard = ds.select(range(start_idx, end_idx))
+        shard.to_parquet(f"{output_dir}/{i:05d}.parquet")
+    
+    print(f"Saved {num_shards} shards to {output_dir}")
 
 
 def prepare_dataset():
@@ -106,8 +127,18 @@ def prepare_dataset():
     - Tokenize the dataset using tokenize_function
     - Save as parquet files
     """
+    print('Started loading dataset...')
     dataset = load_dataset("wikimedia/wikipedia", "20231101.ru", split="train")
-
+    tokenizer = prepare_tokenizer()
+    
+    tokenized_dataset = dataset.map(
+        lambda examples: tokenize_function(examples, tokenizer),
+        batched=True,
+        remove_columns=dataset.column_names
+    )
+    save_as_parquets(tokenized_dataset)
+    
+    return tokenized_dataset
 
 
 def load_tokenized_dataset(data_dir=OUTPUT_DIR):
@@ -117,7 +148,13 @@ def load_tokenized_dataset(data_dir=OUTPUT_DIR):
     - Load them using load_dataset('parquet', data_files=...)
     - Return the 'train' split
     """
-    pass
+    parquet_files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.endswith('.parquet')]
+    parquet_files.sort()
+    
+    dataset = load_dataset('parquet', data_files=parquet_files, split='train')
+    
+    print(f"Loaded dataset with {len(dataset)} samples")
+    return dataset
 
 
 def split_dataset(dataset, validation_size=VALIDATION_SIZE):
@@ -171,6 +208,7 @@ def create_model(tokenizer):
 
 def initialize_wandb():
     wandb.init(
+        mode="offline",
         project="your_project_name",
         name="bs",
         settings=wandb.Settings(
@@ -193,20 +231,148 @@ def train_model():
     - Run final evaluation and print results
     - Finish wandb
     """
+    initialize_wandb()
+    
+    tokenizer = prepare_tokenizer()
+    
+    dataset = load_tokenized_dataset()
+    
+    train_dataset, eval_dataset = split_dataset(dataset)
+    
+    model = create_model(tokenizer)
+    
+    training_args = TrainingArguments(
+        **TRAINING_CONFIG
+    )
+    
     trainer = Trainer(
-        ...,
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        tokenizer=tokenizer,
         callbacks=[TimeoutCallback(timeout_seconds=MAX_TRAINING_TIME_SECONDS)] # dont change
         )
     trainer.train()
     print("Running final evaluation...")
     eval_results = trainer.evaluate()
     print(f"Final evaluation results: {eval_results}")    
-    pass
+    
+    wandb.finish()
+
+
+# ========== SWEEP FUNCTIONS ==========
+
+def train_model_sweep():
+    """
+    Modified version for WandB Sweeps with hyperparameter optimization
+    """
+    wandb.init(mode="offline")
+    
+    sweep_config = wandb.config
+    
+    tokenizer = prepare_tokenizer()
+    dataset = load_tokenized_dataset()
+    train_dataset, eval_dataset = split_dataset(dataset)
+    model = create_model(tokenizer)
+    
+    training_config = {
+        'output_dir': f'{OUTPUT_DIR}/sweep-{wandb.run.id}',
+        'optim': sweep_config.optimizer,
+        'num_train_epochs': 1,
+        'per_device_train_batch_size': sweep_config.batch_size,
+        'save_steps': 10,
+        'save_total_limit': 20,
+        'learning_rate': sweep_config.learning_rate,
+        'lr_scheduler_type': sweep_config.lr_scheduler,
+        'warmup_steps': 200,
+        'weight_decay': 0.01,
+        'logging_steps': 1,
+        'eval_steps': 10,
+        'eval_strategy': 'steps',
+        'load_best_model_at_end': True,
+        'metric_for_best_model': 'eval_loss',
+        'gradient_checkpointing': False,
+        'gradient_accumulation_steps': sweep_config.gradient_accumulation_steps,
+        'torch_compile': sweep_config.torch_compile,
+        'dataloader_num_workers': 4,
+        'report_to': 'wandb',
+    }
+    
+    training_args = TrainingArguments(**training_config)
+    
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        eval_dataset=eval_dataset,
+        tokenizer=tokenizer,
+        callbacks=[TimeoutCallback(timeout_seconds=MAX_TRAINING_TIME_SECONDS)]
+    )
+    trainer.train()
+    
+    print("Running final evaluation...")
+    eval_results = trainer.evaluate()
+    print(f"Final evaluation results: {eval_results}")
+    
+    wandb.log({
+        'final_eval_loss': eval_results['eval_loss'],
+        'final_eval_perplexity': math.exp(eval_results['eval_loss']),
+        'train_runtime': eval_results.get('train_runtime', 0),
+        'train_samples_per_second': eval_results.get('train_samples_per_second', 0),
+    })
+    
+    wandb.finish()
+
+
+def run_sweep():
+    """
+    Run WandB Sweep with 10 experiments
+    """
+    sweep_config = {
+        'method': 'bayes',
+        'metric': {
+            'name': 'final_eval_loss',
+            'goal': 'minimize'
+        },
+        'parameters': {
+            'batch_size': {
+                'values': [2, 4, 8]
+            },
+            'gradient_accumulation_steps': {
+                'values': [1, 2, 4]
+            },
+            'learning_rate': {
+                'values': [1e-5, 5e-5, 1e-4]
+            },
+            'optimizer': {
+                'values': ['adamw_torch', 'adafactor']
+            },
+            'lr_scheduler': {
+                'values': ['linear', 'cosine', 'constant']
+            },
+            'torch_compile': {
+                'values': [True, False]
+            }
+        }
+    }
+    
+    sweep_id = wandb.sweep(
+        sweep_config, 
+        project="qwen-sweep"
+    )
+    
+    print(f"Starting sweep with ID: {sweep_id}")
+    print("This will run experiments with different hyperparameters...")
+    
+    wandb.agent(sweep_id, function=train_model_sweep, count=10)
 
 
 if __name__ == "__main__":
-    # Step 1: Prepare the dataset (run once)
-    # prepare_dataset()
+    prepare_dataset()
     
-    # Step 2: Train the model
-    train_model()
+    # single model training
+    # train_model()
+    
+    # hyperparameter search with 10 experiments
+    run_sweep()
